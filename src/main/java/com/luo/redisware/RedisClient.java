@@ -70,7 +70,11 @@ public class RedisClient {
 
         } finally {
             if (jedis != null) {
-                jedis.close();
+                try {
+                    jedis.close();
+                } catch (Exception e) {
+                    logger.warn("close error when get {} error, e={}", key, e);
+                }
             }
         }
     }
@@ -85,7 +89,11 @@ public class RedisClient {
             throw e;
         } finally {
             if (jedis != null) {
-                jedis.close();
+                try {
+                    jedis.close();
+                } catch (Exception e) {
+                    logger.warn("close error when set {}={} error, e={}", key, value, e);
+                }
             }
         }
     }
