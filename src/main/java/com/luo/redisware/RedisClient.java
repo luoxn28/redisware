@@ -2,19 +2,14 @@ package com.luo.redisware;
 
 import cn.hutool.core.collection.CollectionUtil;
 import com.luo.redisware.config.raw.RedisConfig;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.exceptions.JedisConnectionException;
-import redis.clients.jedis.exceptions.JedisException;
-import redis.clients.util.Hashing;
-import redis.clients.util.MurmurHash;
+import redis.clients.jedis.JedisShardInfo;
+import redis.clients.jedis.ShardedJedis;
+import redis.clients.jedis.ShardedJedisPool;
+import redis.clients.util.SafeEncoder;
 
-import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -28,137 +23,89 @@ import java.util.Random;
 public class RedisClient {
     private static Logger logger = LogManager.getLogger(RedisClient.class);
 
+    private GenericObjectPoolConfig defaultPoolConfig = new GenericObjectPoolConfig();
+    {
+        // 初始化默认pool配置
+        defaultPoolConfig.setMaxIdle(20);
+        defaultPoolConfig.setMinIdle(5);
+        defaultPoolConfig.setMaxTotal(200);
+        defaultPoolConfig.setMaxWaitMillis(2000);
+        defaultPoolConfig.setBlockWhenExhausted(false);
+    }
+
     private List<RedisConfig> redisList;
 
-    private List<JedisPool> masterPoolList = new ArrayList<>();
-    private List<List<JedisPool>> slavePoolList = new ArrayList<>();
+    private ShardedJedisPool masterJedisPool;
+    private ShardedJedisPool slaveJedisPool;
 
-    private Hashing algo = new MurmurHash();
-
-    public RedisClient(List<RedisConfig> redisList) {
+    public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig) {
         if (CollectionUtil.isEmpty(redisList)) {
             throw new RuntimeException("List<RedisConfig> redisList is empty");
         }
 
         this.redisList = redisList;
+
+        List<JedisShardInfo> masterList = new ArrayList<>();
+        List<JedisShardInfo> slaveList = new ArrayList<>();
         for (RedisConfig config : redisList) {
-            this.masterPoolList.add(RedisConfig.buildPool(config.getPoolConfig(), config.getMaster()));
-            this.slavePoolList.add(RedisConfig.buildPoolList(config.getPoolConfig(), config.getSlaveList()));
+            masterList.add(config.getMaster());
+            slaveList.add(config.getSlave() != null ? config.getSlave() : config.getMaster());
+        }
+
+        if (poolConfig == null) {
+            poolConfig = defaultPoolConfig;
+        }
+        this.masterJedisPool = new ShardedJedisPool(poolConfig, masterList);
+        this.slaveJedisPool = new ShardedJedisPool(poolConfig, slaveList);
+    }
+
+    private ShardedJedis getJedis() {
+        try {
+            return this.masterJedisPool.getResource();
+        } catch (Throwable e) {
+            logger.error("getJedis error, e={}", e);
+            throw e;
         }
     }
 
-    public String get(String key) throws Exception {
-        JedisWrap jedis = null;
+    private ShardedJedis getJedis(boolean isRead) {
         try {
-            jedis = getJedisWrap(key, true);
-            return jedis.getJedis().get(key);
-        } catch (Exception e) {
-            logger.error("get {} error, e={}", key, e);
-
-            Jedis tmpJedis = null;
-            try {
-                tmpJedis = readFailover(e, jedis);
-                return tmpJedis.get(key);
-            } catch (Exception e2) {
-                logger.error("failover get {} error, e={}", key, e2);
-                throw e2;
-            } finally {
-                if (tmpJedis != null) {
-                    tmpJedis.close();
-                }
-            }
-
-        } finally {
-            if (jedis != null) {
-                try {
-                    jedis.close();
-                } catch (Exception e) {
-                    logger.warn("close error when get {} error, e={}", key, e);
-                }
-            }
+            return (isRead && new Random().nextBoolean()) ?
+                    this.slaveJedisPool.getResource() : this.masterJedisPool.getResource();
+        } catch (Throwable e) {
+            logger.error("getJedis error, e={}", e);
+            throw e;
         }
     }
 
-    public String set(String key, String value) throws Exception {
-        Jedis jedis = null;
+    public String set(String key, String value, int expire) throws Exception {
+        return set(key, SafeEncoder.encode(value), expire);
+    }
+
+    public String set(String key, byte[] value, int expire) throws Exception {
+        ShardedJedis jedis = null;
         try {
-            jedis = getJedis(key);
-            return jedis.set(key, value);
+            jedis = getJedis();
+            return jedis.setex(SafeEncoder.encode(key), expire, value);
         } catch (Exception e) {
             logger.warn("set {}={} error, e={}", key, value, e);
             throw e;
         } finally {
             if (jedis != null) {
-                try {
-                    jedis.close();
-                } catch (Exception e) {
-                    logger.warn("close error when set {}={} error, e={}", key, value, e);
-                }
+                jedis.close();
             }
         }
     }
 
-    /**
-     * 读失败转移
-     */
-    private Jedis readFailover(Exception e, JedisWrap jedis) throws Exception {
-        if ((jedis == null) || !(e instanceof JedisConnectionException)) {
+    public String get(String key) throws Exception {
+        ShardedJedis jedis = null;
+        try {
+            jedis = getJedis(true);
+            return jedis.get(key);
+        } catch (Exception e) {
+            logger.error("get {} error, e={}", key, e);
             throw e;
-        }
-
-        int index = jedis.getIndex();
-        if (jedis.isMaster()) {
-            List<JedisPool> slaveList = slavePoolList.get(index);
-            if (CollectionUtil.isEmpty(slaveList)) {
-                throw e;
-            }
-
-            return slaveList.get(new Random().nextInt(slaveList.size())).getResource();
-        } else {
-            return masterPoolList.get(index).getResource();
-        }
-    }
-
-    private Jedis getJedis(String key) throws JedisException, UnsupportedEncodingException {
-        int index = (int) (this.algo.hash(key.getBytes("UTF-8")) % masterPoolList.size());
-        if (index < 0) {
-            index += masterPoolList.size();
-        }
-
-        return masterPoolList.get(index).getResource();
-    }
-
-    private JedisWrap getJedisWrap(String key, boolean isRead) throws JedisException, UnsupportedEncodingException {
-        int index = (int) (this.algo.hash(key.getBytes("UTF-8")) % masterPoolList.size());
-        index = index < 0 ? index + masterPoolList.size() : index;
-
-        if (!isRead) {
-            return new JedisWrap(masterPoolList.get(index).getResource(), index, true);
-        } else {
-            List<JedisPool> poolList = slavePoolList.get(index);
-            if (poolList.isEmpty()) {
-                return new JedisWrap(masterPoolList.get(index).getResource(), index, true);
-            } else {
-                // master + slave 随机读
-                int n = new Random().nextInt(poolList.size() + 1);
-                if (n == poolList.size()) {
-                    return new JedisWrap(masterPoolList.get(index).getResource(), index, true);
-                } else {
-                    return new JedisWrap(poolList.get(n).getResource(), index, false);
-                }
-            }
-        }
-    }
-
-    @Data
-    @NoArgsConstructor
-    @AllArgsConstructor
-    class JedisWrap {
-        Jedis jedis;
-        int index;
-        boolean master;
-
-        void close() {
+        } finally {
             if (jedis != null) {
                 jedis.close();
             }
