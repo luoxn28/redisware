@@ -25,9 +25,12 @@ public class RedisConfig {
     private NodeConfig master;
     private List<NodeConfig> slaveList;
 
+    /**
+     * slave实例创建连接池
+     */
     public static List<JedisPool> buildPoolList(GenericObjectPoolConfig pool, List<NodeConfig> nodeList) {
         if (CollectionUtil.isEmpty(nodeList)) {
-            return null;
+            return new ArrayList<>();
         }
 
         List<JedisPool> poolList = new ArrayList<>();
@@ -37,6 +40,9 @@ public class RedisConfig {
         return poolList;
     }
 
+    /**
+     * master实例创建连接池
+     */
     public static JedisPool buildPool(GenericObjectPoolConfig pool, NodeConfig node) {
         if (node == null) {
             throw new RuntimeException("buildPool nodeConfig is null");
