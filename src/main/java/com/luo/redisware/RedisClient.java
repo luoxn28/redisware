@@ -19,6 +19,10 @@ import java.util.Random;
 /**
  * 分布式Redis客户端
  *
+ * 1. 支持redis master/slave 读写分离
+ * 2. 支持redis故障转移，需要配置redis-sentinel
+ * 3. 支持master/slave读操作失败转移重试
+ *
  * @author xiangnan
  * @date 2018/3/19 11:47
  */
@@ -161,7 +165,7 @@ public class RedisClient {
         return set(key, SafeEncoder.encode(value), expire);
     }
 
-    public String set(String key, byte[] value, int expire) throws Exception {
+    public String set(final String key, final byte[] value, final int expire) throws Exception {
         ShardedJedis jedis = null;
         try {
             jedis = getJedis();
@@ -169,18 +173,12 @@ public class RedisClient {
         } catch (Exception e) {
             logger.error("set {}={} error, e={}", key, value, e);
 
-            ShardedJedis tmpJedis = null;
-            try {
-                tmpJedis = sentinelFailover(e);
-                return tmpJedis.setex(SafeEncoder.encode(key), expire, value);
-            } catch (Exception ex) {
-                logger.error("sentinel failover set {}={} error, e={}", key, value, e);
-                throw e;
-            } finally {
-                if (tmpJedis != null) {
-                    tmpJedis.close();
+            return sentinelFailover(e, new SentinelCallback<String>() {
+                @Override
+                public String callback(ShardedJedis jedis) {
+                    return jedis.setex(SafeEncoder.encode(key), expire, value);
                 }
-            }
+            });
         } finally {
             if (jedis != null) {
                 jedis.close();
@@ -188,7 +186,7 @@ public class RedisClient {
         }
     }
 
-    public String get(String key) throws Exception {
+    public String get(final String key) throws Exception {
         ShardedJedis jedis = null;
         try {
             jedis = getJedis(true);
@@ -196,19 +194,12 @@ public class RedisClient {
         } catch (Exception e) {
             logger.error("get {} error, e={}", key, e);
 
-            ShardedJedis tmpJedis = null;
-            try {
-                Boolean master = this.masterRead.get();
-                tmpJedis = (master != null && master) ? getSlaveJedis() : getJedis();
-                return tmpJedis.get(key);
-            } catch (Exception e2) {
-                logger.error("failover get {} error, e={}", key, e);
-                throw e;
-            } finally {
-                if (tmpJedis != null) {
-                    tmpJedis.close();
+            return readFailover(new ReadCallback<String>() {
+                @Override
+                public String callback(ShardedJedis jedis) {
+                    return jedis.get(key);
                 }
-            }
+            });
         } finally {
             if (jedis != null) {
                 jedis.close();
@@ -216,29 +207,75 @@ public class RedisClient {
         }
     }
 
+    private <T> T readFailover(ReadCallback<T> callback) {
+        ShardedJedis jedis = null;
+        try {
+            Boolean master = this.masterRead.get();
+            jedis = (master != null && master) ? getSlaveJedis() : getJedis();
+            return callback.callback(jedis);
+        } catch (Exception e) {
+            logger.error("readFailover error, e={}", e);
+            throw e;
+        } finally {
+            if (jedis != null) {
+                jedis.close();
+            }
+        }
+    }
+
+    /**
+     * 非读超时异常时故障转移
+     *
+     * @return e
+     * @throws Exception 非读超时异常
+     */
+    private <T> T sentinelFailover(Exception e, SentinelCallback<T> callback) throws Exception {
+
+        if (!(e instanceof JedisConnectionException) || (e.getMessage() == null) || e.getMessage().contains("Read timed out")) {
+            throw e;
+        }
+
+        ShardedJedis jedis = null;
+        try {
+            jedis = sentinelFailover(e);
+            return callback.callback(jedis);
+        } catch (Exception ex) {
+            logger.error("sentinelFailover error: e={}", ex);
+            throw e;
+        } finally {
+            if (jedis != null) {
+                jedis.close();
+            }
+        }
+    }
+
+    /**
+     * 非读超时异常时进行主备连接池切换，并返回master连接
+     *
+     * @param e 非读超市异常类
+     * @return master连接
+     * @throws Exception e
+     */
     private ShardedJedis sentinelFailover(Exception e) throws Exception {
 
-        if ((e instanceof JedisConnectionException) && (e.getMessage() != null) &&
-                !e.getMessage().contains("Read timed out")) {
+        // failover, Redis master实例可能挂了
+        List<Jedis> jedisList = new ArrayList<>();
+        for (JedisShardInfo redisConfig : this.sentinelList) {
+            jedisList.add(new Jedis(redisConfig.getHost(), redisConfig.getPort()));
+        }
 
-            // failover, Redis master实例可能挂了
-            List<Jedis> jedisList = new ArrayList<>();
-            for (JedisShardInfo redisConfig : this.sentinelList) {
-                jedisList.add(new Jedis(redisConfig.getHost(), redisConfig.getPort()));
+        boolean sentinelFailover = false;
+        for (RedisConfig redisConfig : this.redisList) {
+            JedisShardInfo slave = redisConfig.getSlave();
+
+            if (redisConfig.getMaster() == slave) {
+                // 只配置了master，无法进行主备切换
+                continue;
             }
 
-            boolean sentinelFailover = false;
-            for (RedisConfig redisConfig : this.redisList) {
-                JedisShardInfo slave = redisConfig.getSlave();
-
-                if (redisConfig.getMaster() == slave) {
-                    // 只配置了master，无法进行主备切换
-                    continue;
-                }
-
-                for (Jedis jedis : jedisList) {
+            for (Jedis jedis : jedisList) {
+                try {
                     List<String> masterList = jedis.sentinelGetMasterAddrByName(redisConfig.getSentinelName());
-                    System.out.println("sentinel array: " + masterList);
                     if (masterList.contains(String.valueOf(slave.getPort())) &&
                             (masterList.contains(slave.getHost()) || masterList.contains("127.0.0.1"))) {
                         sentinelFailover = true;
@@ -246,33 +283,33 @@ public class RedisClient {
                         // sentinel已经进行了主备切换，这里也跟着进行主备信息切换
                         redisConfig.setSlave(redisConfig.getMaster());
                         redisConfig.setMaster(slave);
+                        break;
                     }
+                } catch (Exception ex) {
+                    // redis-sentinel可能挂了，单个redis-sentinel挂了继续使用其他redis-sentinel
+                    logger.error("redis-sentinel over... sentinelList={}", this.sentinelList);
                 }
             }
+        }
 
-            if (sentinelFailover) {
-                logger.info("getJedis sentinelFailover: redisList={}", this.redisList);
-
-                List<JedisShardInfo> masterList = new ArrayList<>();
-                List<JedisShardInfo> slaveList = new ArrayList<>();
-                for (RedisConfig config : this.redisList) {
-                    masterList.add(config.getMaster());
-                    slaveList.add(config.getSlave() != null ? config.getSlave() : config.getMaster());
-                }
-
-                this.masterList = masterList;
-                this.slaveList = slaveList;
-                intitJedisPool(this.poolConfig, this.masterList, this.slaveList);
-
-                return this.masterJedisPool.getResource();
-            } else {
-                throw e;
-            }
-
-        } else {
+        if (!sentinelFailover) {
             throw e;
         }
 
+        logger.info("sentinelFailover: redisList={}", this.redisList);
+
+        List<JedisShardInfo> masterList = new ArrayList<>();
+        List<JedisShardInfo> slaveList = new ArrayList<>();
+        for (RedisConfig config : this.redisList) {
+            masterList.add(config.getMaster());
+            slaveList.add(config.getSlave() != null ? config.getSlave() : config.getMaster());
+        }
+
+        this.masterList = masterList;
+        this.slaveList = slaveList;
+        intitJedisPool(this.poolConfig, this.masterList, this.slaveList);
+
+        return this.masterJedisPool.getResource();
     }
 
 }
