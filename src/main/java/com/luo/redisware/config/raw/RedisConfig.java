@@ -15,6 +15,7 @@ import redis.clients.jedis.JedisShardInfo;
 @NoArgsConstructor
 @AllArgsConstructor
 public class RedisConfig {
+    private String sentinelName;
     private JedisShardInfo master;
     private JedisShardInfo slave;
 }
