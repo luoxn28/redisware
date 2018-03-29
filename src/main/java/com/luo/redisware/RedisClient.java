@@ -16,6 +16,7 @@ import redis.clients.util.SafeEncoder;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.Semaphore;
 
 /**
  * 分布式Redis客户端
@@ -59,6 +60,11 @@ public class RedisClient {
      * 出现读异常时，用于判断当前读操作是master读还是slave读
      */
     private ThreadLocal<Boolean> masterRead = new ThreadLocal<>();
+
+    /**
+     * 限制进行故障转移线程数
+     */
+    private Semaphore sentinelSemaphore = new Semaphore(2);
 
     public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig) {
         this(redisList, poolConfig, READ_MODE_MASTER_ONLY, null);
@@ -273,18 +279,25 @@ public class RedisClient {
             }
         }
 
-        ShardedJedis jedis = null;
-        try {
-            jedis = sentinelFailover(e);
-            return callback.callback(jedis);
-        } catch (Exception ex) {
-            logger.error("sentinelFailover error: e={}", ex);
-            throw e;
-        } finally {
-            if (jedis != null) {
-                jedis.close();
+        if (this.sentinelSemaphore.tryAcquire()) {
+            ShardedJedis jedis = null;
+            try {
+                jedis = sentinelFailover(e);
+                return callback.callback(jedis);
+            } catch (Exception ex) {
+                logger.error("sentinelFailover error: e={}", ex);
+                throw e;
+            } finally {
+                if (jedis != null) {
+                    jedis.close();
+                }
+
+                this.sentinelSemaphore.release();
             }
+        } else {
+            throw e;
         }
+
     }
 
     /**
