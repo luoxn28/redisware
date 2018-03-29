@@ -10,6 +10,7 @@ import redis.clients.jedis.JedisShardInfo;
 import redis.clients.jedis.ShardedJedis;
 import redis.clients.jedis.ShardedJedisPool;
 import redis.clients.jedis.exceptions.JedisConnectionException;
+import redis.clients.jedis.exceptions.JedisDataException;
 import redis.clients.util.SafeEncoder;
 
 import java.util.ArrayList;
@@ -39,8 +40,7 @@ public class RedisClient {
     {
         // 初始化默认pool配置
         defaultPoolConfig.setMaxIdle(20);
-        defaultPoolConfig.setMinIdle(5);
-        defaultPoolConfig.setMaxTotal(200);
+        defaultPoolConfig.setMaxTotal(500);
         defaultPoolConfig.setMaxWaitMillis(2000);
         defaultPoolConfig.setBlockWhenExhausted(false);
     }
@@ -64,6 +64,14 @@ public class RedisClient {
         this(redisList, poolConfig, READ_MODE_MASTER_ONLY, null);
     }
 
+    public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig, int readMode) {
+        this(redisList, poolConfig, readMode, null);
+    }
+
+    public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig, List<JedisShardInfo> sentinelList) {
+        this(redisList, poolConfig, READ_MODE_MASTER_ONLY, sentinelList);
+    }
+
     public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig, int readMode,
                        List<JedisShardInfo> sentinelList) {
         if (CollectionUtil.isEmpty(redisList)) {
@@ -73,13 +81,6 @@ public class RedisClient {
         this.redisList = redisList;
         if ((READ_MODE_MASTER_ONLY <= readMode) && (readMode <= READ_MODE_SLAVE_ONLY)) {
             this.readMode = readMode;
-        }
-
-        List<JedisShardInfo> masterList = new ArrayList<>();
-        List<JedisShardInfo> slaveList = new ArrayList<>();
-        for (RedisConfig config : redisList) {
-            masterList.add(config.getMaster());
-            slaveList.add(config.getSlave() != null ? config.getSlave() : config.getMaster());
         }
 
         if (poolConfig != null) {
@@ -100,6 +101,13 @@ public class RedisClient {
             }
         }
 
+        List<JedisShardInfo> masterList = new ArrayList<>();
+        List<JedisShardInfo> slaveList = new ArrayList<>();
+        for (RedisConfig config : redisList) {
+            masterList.add(config.getMaster());
+            slaveList.add(config.getSlave() != null ? config.getSlave() : config.getMaster());
+        }
+
         this.masterList = masterList;
         this.slaveList = slaveList;
         intitJedisPool(this.poolConfig, this.masterList, this.slaveList);
@@ -114,6 +122,9 @@ public class RedisClient {
         this.slaveJedisPool = new ShardedJedisPool(poolConfig, slaveList);
     }
 
+    /**
+     * 获取master jedis连接
+     */
     private ShardedJedis getJedis() {
         try {
             return this.masterJedisPool.getResource();
@@ -123,6 +134,9 @@ public class RedisClient {
         }
     }
 
+    /**
+     * 获取slave jedis连接
+     */
     private ShardedJedis getSlaveJedis() {
         try {
             return this.slaveJedisPool.getResource();
@@ -132,6 +146,9 @@ public class RedisClient {
         }
     }
 
+    /**
+     * 根据readMode获取jedis连接
+     */
     private ShardedJedis getJedis(boolean isRead) {
         boolean master = true;
 
@@ -161,6 +178,12 @@ public class RedisClient {
         }
     }
 
+    /**
+     * 设置key/value，异常时会尝试进行故障转移
+     *
+     * @param expire 过期时间，单位 s
+     * @throws Exception e
+     */
     public String set(String key, String value, int expire) throws Exception {
         return set(key, SafeEncoder.encode(value), expire);
     }
@@ -186,6 +209,12 @@ public class RedisClient {
         }
     }
 
+    /**
+     * 获取key，异常时会尝试进行失败转移，读操作进行失败转移时不会进行故障转移，
+     * 如果redis-sentinel进行了故障转移，则失败转移后就能够读数据了
+     *
+     * @throws Exception e
+     */
     public String get(final String key) throws Exception {
         ShardedJedis jedis = null;
         try {
@@ -231,8 +260,17 @@ public class RedisClient {
      */
     private <T> T sentinelFailover(Exception e, SentinelCallback<T> callback) throws Exception {
 
-        if (!(e instanceof JedisConnectionException) || (e.getMessage() == null) || e.getMessage().contains("Read timed out")) {
-            throw e;
+        /**
+         * JedisDataException 为对redis数据操作异常，此时尝试进行主备切换
+         *
+         * JedisConnectionException "Read timed out" - redis响应慢
+         *                          "Could not get a resource from the pool" - 连接池资源耗尽
+         */
+        if (!(e instanceof JedisDataException)) {
+            if (!(e instanceof JedisConnectionException) || (e.getMessage() == null) ||
+                    e.getMessage().contains("Read timed out") || e.getMessage().contains("Could not get a resource from the pool")) {
+                throw e;
+            }
         }
 
         ShardedJedis jedis = null;
@@ -250,7 +288,7 @@ public class RedisClient {
     }
 
     /**
-     * 非读超时异常时进行主备连接池切换，并返回master连接
+     * 非读超时异常时进行主备连接池切换，并返回master连接，调用该方法时，为了防止过多线程进行主备切换使用信号量进行限制
      *
      * @param e 非读超市异常类
      * @return master连接
@@ -293,6 +331,7 @@ public class RedisClient {
         }
 
         if (!sentinelFailover) {
+            logger.info("sentinelFailover is false, redis-sentinel可能还没有进行故障转移");
             throw e;
         }
 
