@@ -2,6 +2,7 @@ package com.luo.redisware;
 
 import cn.hutool.core.collection.CollectionUtil;
 import com.luo.redisware.config.raw.RedisConfig;
+import lombok.Setter;
 import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -65,6 +66,12 @@ public class RedisClient {
      * 限制进行故障转移线程数
      */
     private Semaphore sentinelSemaphore = new Semaphore(2);
+
+    /**
+     * 是否使能读失败转移，默认true
+     */
+    @Setter
+    private boolean readFailoverEnabled = true;
 
     public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig) {
         this(redisList, poolConfig, READ_MODE_MASTER_ONLY, null);
@@ -229,7 +236,7 @@ public class RedisClient {
         } catch (Exception e) {
             logger.error("get {} error, e={}", key, e);
 
-            return readFailover(new ReadCallback<String>() {
+            return readFailover(e, new ReadCallback<String>() {
                 @Override
                 public String callback(ShardedJedis jedis) {
                     return jedis.get(key);
@@ -242,14 +249,22 @@ public class RedisClient {
         }
     }
 
-    private <T> T readFailover(ReadCallback<T> callback) {
+    /**
+     * 读失败转移
+     * @throws Exception e
+     */
+    private <T> T readFailover(Exception e, ReadCallback<T> callback) throws Exception {
+        if (!readFailoverEnabled) {
+            throw e;
+        }
+
         ShardedJedis jedis = null;
         try {
             Boolean master = this.masterRead.get();
             jedis = (master != null && master) ? getSlaveJedis() : getJedis();
             return callback.callback(jedis);
-        } catch (Exception e) {
-            logger.error("readFailover error, e={}", e);
+        } catch (Exception ex) {
+            logger.error("readFailover error, e={}", ex);
             throw e;
         } finally {
             if (jedis != null) {
