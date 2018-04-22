@@ -1,7 +1,11 @@
 package com.luo.redisware;
 
 import cn.hutool.core.collection.CollectionUtil;
+import com.luo.redisware.callback.ReadCallback;
+import com.luo.redisware.callback.SentinelCallback;
 import com.luo.redisware.config.raw.RedisConfig;
+import com.luo.redisware.util.ReadMode;
+import com.luo.redisware.util.RediswareUtil;
 import lombok.Setter;
 import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
 import org.apache.logging.log4j.LogManager;
@@ -27,25 +31,14 @@ import java.util.concurrent.Semaphore;
  * 3. 支持master/slave读操作失败转移重试
  *
  * @author xiangnan
- * @date 2018/3/19 11:47
+ * date 2018/3/19 11:47
  */
 public class RedisClient {
-    private static Logger logger = LogManager.getLogger(RedisClient.class);
+    private final static Logger logger = LogManager.getLogger(RedisClient.class);
 
-    public final static int READ_MODE_MASTER_ONLY  = 0;
-    public final static int READ_MODE_MASTER_SLAVE = 1;
-    public final static int READ_MODE_SLAVE_ONLY   = 2;
+    private int readMode = ReadMode.MASTER_ONLY;
 
-    private int readMode = READ_MODE_MASTER_ONLY;
-
-    private GenericObjectPoolConfig defaultPoolConfig = new GenericObjectPoolConfig();
-    {
-        // 初始化默认pool配置
-        defaultPoolConfig.setMaxIdle(20);
-        defaultPoolConfig.setMaxTotal(500);
-        defaultPoolConfig.setMaxWaitMillis(2000);
-        defaultPoolConfig.setBlockWhenExhausted(false);
-    }
+    private GenericObjectPoolConfig defaultPoolConfig = RediswareUtil.defaultPoolConfig();
 
     private List<RedisConfig> redisList;
     private List<JedisShardInfo> sentinelList = new ArrayList<>();
@@ -74,7 +67,7 @@ public class RedisClient {
     private boolean readFailoverEnabled = true;
 
     public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig) {
-        this(redisList, poolConfig, READ_MODE_MASTER_ONLY, null);
+        this(redisList, poolConfig, ReadMode.MASTER_ONLY, null);
     }
 
     public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig, int readMode) {
@@ -82,7 +75,7 @@ public class RedisClient {
     }
 
     public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig, List<JedisShardInfo> sentinelList) {
-        this(redisList, poolConfig, READ_MODE_MASTER_ONLY, sentinelList);
+        this(redisList, poolConfig, ReadMode.MASTER_ONLY, sentinelList);
     }
 
     public RedisClient(List<RedisConfig> redisList, GenericObjectPoolConfig poolConfig, int readMode,
@@ -92,7 +85,7 @@ public class RedisClient {
         }
 
         this.redisList = redisList;
-        if ((READ_MODE_MASTER_ONLY <= readMode) && (readMode <= READ_MODE_SLAVE_ONLY)) {
+        if (ReadMode.validReadMode(readMode)) {
             this.readMode = readMode;
         }
 
@@ -123,13 +116,13 @@ public class RedisClient {
 
         this.masterList = masterList;
         this.slaveList = slaveList;
-        intitJedisPool(this.poolConfig, this.masterList, this.slaveList);
+        initJedisPool(this.poolConfig, this.masterList, this.slaveList);
     }
 
     /**
      * 初始化master、slave连接池
      */
-    private void intitJedisPool(GenericObjectPoolConfig poolConfig,
+    private void initJedisPool(GenericObjectPoolConfig poolConfig,
                                 List<JedisShardInfo> masterList, List<JedisShardInfo> slaveList) {
         this.masterJedisPool = new ShardedJedisPool(poolConfig, masterList);
         this.slaveJedisPool = new ShardedJedisPool(poolConfig, slaveList);
@@ -167,15 +160,15 @@ public class RedisClient {
 
         if (isRead) {
             switch (this.readMode) {
-                case READ_MODE_SLAVE_ONLY: {
+                case ReadMode.SLAVE_ONLY: {
                     master = false;
                     break;
                 }
-                case READ_MODE_MASTER_SLAVE: {
+                case ReadMode.MASTER_SLAVE: {
                     master = new Random().nextBoolean();
                     break;
                 }
-                case READ_MODE_MASTER_ONLY:
+                case ReadMode.MASTER_ONLY:
                 default: {
                     break;
                 }
@@ -281,7 +274,7 @@ public class RedisClient {
      */
     private <T> T sentinelFailover(Exception e, SentinelCallback<T> callback) throws Exception {
 
-        /**
+        /*
          * JedisDataException 为对redis数据操作异常，此时尝试进行主备切换
          *
          * JedisConnectionException "Read timed out" - redis响应慢
@@ -374,7 +367,7 @@ public class RedisClient {
 
         this.masterList = masterList;
         this.slaveList = slaveList;
-        intitJedisPool(this.poolConfig, this.masterList, this.slaveList);
+        initJedisPool(this.poolConfig, this.masterList, this.slaveList);
 
         return this.masterJedisPool.getResource();
     }

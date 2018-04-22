@@ -9,7 +9,7 @@ import redis.clients.jedis.JedisShardInfo;
  * Redis实例配置，包括 master slave
  *
  * @author xiangnan
- * @date 2018/3/20 14:20
+ * date 2018/3/20 14:20
  */
 @Data
 @NoArgsConstructor

@@ -7,7 +7,7 @@ import redis.clients.jedis.JedisPool;
 
 /**
  * @author xiangnan
- * @date 2018/3/19 19:41
+ * date 2018/3/19 19:41
  */
 public class RedisTest {
 
